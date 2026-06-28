@@ -58,7 +58,22 @@ docker run -d --name rebootbench-nginx --restart=always -p 18080:80 nginx:alpine
 |---|---|---|---|
 | `kill` | SUT 環境 (restart policy / supervisor / k8s) の自己復活力 + SUT 起動コスト | RT | 自動復活が無ければ `status=no_recovery` を残す (それも測定結果) |
 | `kill-start` | 突然死 + 外部観察者の即時 (or 遅延 `--kill-start-delay`) 再起動命令 + SUT 起動コスト | RT (検知 + 操作 + 起動) | `start_at` を別途記録するので分解分析できる |
-| `restart` | `docker restart -t N` — daemon が SIGTERM→grace→SIGKILL→start を atomic に行う「計画的再起動」のコスト | RC (Restart Cost) | grace=0 で即 SIGKILL → start |
+| `restart` | `<runtime> restart -t N` — daemon が SIGTERM→grace→SIGKILL→start を atomic に行う「計画的再起動」のコスト | RC (Restart Cost) | grace=0 で即 SIGKILL → start。podman rootless では使用不可 (port re-bind 競合) |
+| `systemctl-kill` | bare process: `systemctl kill -s SIGKILL <unit>`。Restart= に依存 | RT | A: 「コンテナを介さない下限値」 |
+| `systemctl-restart` | bare process: `systemctl restart <unit>` を atomic に発行 | RC | A: bare RC |
+| `oci-restart` | OCI runtime 直接: `<runtime> delete --force → run --detach`。daemon/CLI ラッパー無し | RT | B: OCI runtime 単独コスト。runc/crun 切替可 (`--oci-runtime`) |
+
+## 4 層スタックの整理 (Phase 0.7 RESULTS.md より)
+
+同じ SUT (`experiments/tinyserver`) を以下 4 層で再起動した時の p50 復活時間:
+
+| layer | injector | p50 ms |
+|---|---|---:|
+| bare process | `systemctl-restart` | ~35 |
+| OCI crun direct | `oci-restart --oci-runtime=crun` | ~36 |
+| OCI runc direct | `oci-restart --oci-runtime=runc` | ~157 |
+| podman (CLI) | `kill-start --runtime=podman` | ~830 |
+| docker (daemon) | `kill-start --runtime=docker` | ~1565 |
 
 「何を測るか」によってモードを選ぶこと。観察者が `start` を打つことを Injector に含めると、SUT 単独のレジリエンスを測っているのか、観察者の反応も含めた合成測定なのか混同するため、明示的に分けている。
 

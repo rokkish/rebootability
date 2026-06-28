@@ -3,3 +3,5 @@
 *.db-wal
 *.db-shm
 *.csv
+experiments/tinyserver/tinyserver
+experiments/oci_bundle/rootfs/tinyserver

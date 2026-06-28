@@ -232,6 +232,95 @@ delay=200ms を差し引いた純粋な kill CLI は docker ~900-1030ms / podman
   も得られる (`--restart=always` がコンテナ exit で `systemd-run` 経由に発火する
   パターン)。
 
+## Phase 0.7: 4 層スタックの分解
+
+「nginx の再起動」と思っていた数字の正体を切り分けるため、**同じ SUT**
+(`tinyserver` という最小 Go HTTP サーバ) を 4 つの実行モデルで再起動し、
+復活時間を計測した:
+
+```
+[1] systemd --user             (bare process)
+[2a] crun direct  (OCI runtime)
+[2b] runc direct  (OCI runtime)
+[3] podman rootless            (container CLI)
+[4] docker                     (container daemon)
+```
+
+固定条件: probe interval=5ms, probe-timeout=5ms, 20 trial。
+container CLI/daemon は `kill-start` モード + 200ms delay (podman の
+rootlessport 問題回避用)。OCI runtime と systemd には delay 不要。
+
+### 結果 (20 trial、completed のみ)
+
+| layer | injector | p50 (ms) | p99 (ms) | 完走率 | delay 差引 p50 |
+|---|---|---:|---:|---:|---:|
+| [1]  bare       | `systemctl-restart --user` | 35   | 37   | 20/20 | 35   |
+| [2a] OCI crun   | `crun delete --force; run` | 36   | 41   | 20/20 | 36   |
+| [2b] OCI runc   | `runc delete --force; run` | 157  | 162  | 20/20 | 157  |
+| [3]  podman     | `kill; sleep 200ms; start` | 1027 | 1087 | 20/20 | **827**  |
+| [4]  docker     | `kill; sleep 200ms; start` | 1765 | 1860 | 20/20 | **1565** |
+
+### Figure 1: 階層的オーバヘッドの積み上げ
+
+```
+delay 差引 p50 ms (lower is better)
+ 0         500        1000       1500     2000
+ |---------|----------|----------|--------|
+ |#| 35      systemd --user  (bare process)
+ |#| 36      crun direct     (OCI runtime, C 実装)
+ |##| 157    runc direct     (OCI runtime, Go 実装)
+ |#####################| 827               podman rootless (CLI)
+ |######################################| 1565   docker (daemon)
+```
+
+### 観察
+
+1. **bare process と OCI runtime (crun) はほぼ同じ ~35ms**。crun は process
+   fork + namespace setup + exec で済むので、bare process restart に対して
+   追加コストはほぼゼロ。
+2. **crun → runc で +120ms**。両者とも同じ OCI 仕様を実装する CLI だが、
+   runc は Go 実装 (Go runtime の startup) で crun は C 実装。同じ仕事を
+   する 2 つのツールが 4 倍違う = **言語/runtime 選択そのものがレジリエンスに
+   影響する**。
+3. **OCI runtime → podman で +790ms**。podman は内部で crun を呼ぶので、この
+   差分は純粋に CLI ラッパー層 (image lookup、OCI bundle 生成、rootlessport
+   setup、cgroups、systemd-cgroups 通信) のコスト。
+4. **podman → docker で +740ms**。docker は内部で containerd → runc を呼ぶ
+   構造で、daemon との RPC、docker-proxy の port forwarding、各種状態管理が
+   乗る。podman より構成が深く、その分が overhead として観察できる。
+5. **「nginx の再起動」と思っていた 1.5s の 99% は SUT 由来でない**。
+   実際は: tinyserver 起動 (~35ms) + OCI/CLI/daemon layer (1530ms)。
+   nginx 自身の起動も ~35ms 程度と推定される (tinyserver と同じ Go HTTP
+   サーバオーダー、しかも nginx は C で軽量)。
+
+### 計測ハック: detach した grandchild が pipe をブロックする問題
+
+OCI runtime injector を実装した際、`crun run --detach` を `exec.Command(...).CombinedOutput()` で叩くと **数十秒のハング** が起きた。
+
+原因: `--detach` モードで crun は double-fork し、grandchild (= tinyserver)
+が親から継承した stdout/stderr の FD を保持し続ける。Go の CombinedOutput
+は pipe で stdout/stderr を読むので、grandchild がその pipe writer を
+握っている限り EOF が来ず、`cmd.Wait()` が永遠に return しない。
+
+これは exec.Command の Stdout を `nil` のままにしても同じ (Go は親の FD
+を継承させる)。**`os.OpenFile("/dev/null", ...)` を明示的に与える**ことで
+解決。`internal/injector/oci.go` の `runQuiet` を参照。
+
+shell でも `./rebootbench ... | tail -15` がハングする同じ問題が起き、
+最終的に出力を一旦ファイルにリダイレクトしてから読む形にした。
+
+### 含意
+
+- レジリエンスベンチマークは **SUT × runtime stack × オーケストレータ** の
+  合成測定で、各層の overhead を分離計測しないと「SUT のレジリエンス」を
+  比較できない。Phase 3 の 4 軸スコア化 (RT/DI/BR/RC) は **層ごとに** 評価
+  する必要がある。
+- runc vs crun の 4 倍差は **「同じ抽象 (OCI runtime) を実装する 2 ツールの
+  選択がレジリエンスに 4 倍影響する」** という発見。論文の motivating
+  example の有力候補。
+- 次は **C: k8s pod restart** (plan §2.1) を実装すれば 5 層目が乗り、
+  「orchestrator がさらに何 ms 乗せるか」が定量化できる。
+
 ## 完了基準チェック (plan 0.10)
 
 - [x] `rebootbench phase0` コマンドが動く

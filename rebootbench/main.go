@@ -61,15 +61,21 @@ func runPhase0(args []string) {
 	csvPath := fs.String("csv", "", "optional path to write recovery times CSV (default <db_dir>/<experiment_id>.csv)")
 	notes := fs.String("notes", "", "free-form notes saved with the experiment")
 	gitSHA := fs.String("git-sha", "", "git SHA of rebootbench at run time (informational)")
-	runtime := fs.String("runtime", "docker", "container runtime CLI: docker | podman")
+	runtime := fs.String("runtime", "docker", "container runtime CLI: docker | podman (used only for container injectors)")
+	unitName := fs.String("unit", "rebootbench-tinyserver.service", "systemd unit (used by systemctl-* injectors)")
+	systemdUser := fs.Bool("systemd-user", true, "use systemctl --user (used by systemctl-* injectors)")
+	ociRuntime := fs.String("oci-runtime", "crun", "OCI runtime: runc | crun (used by oci-restart)")
+	ociID := fs.String("oci-id", "rebootbench-oci", "OCI container id (used by oci-restart)")
+	ociBundle := fs.String("oci-bundle", "", "OCI bundle dir path (used by oci-restart)")
+	ociDelay := fs.Duration("oci-delay", 0, "OCI delete→run の間に挟む遅延")
 	injectorMode := fs.String("injector", "kill-start",
-		"injection mode: kill | kill-start | restart\n"+
-			"  kill        : docker kill のみ。復活は SUT 環境に依存。\n"+
-			"                自動復活がなければ status=no_recovery を記録する。\n"+
-			"  kill-start  : docker kill 直後に外部から docker start を発行。\n"+
-			"                突然死 + 外部観察者の即時再起動命令を測る。\n"+
-			"  restart     : docker restart -t N (SIGTERM→grace→SIGKILL→start)。\n"+
-			"                計画的再起動のコストを測る。")
+		"injection mode: kill | kill-start | restart | systemctl-kill | systemctl-restart | oci-restart\n"+
+			"  kill              : <runtime> kill のみ。復活は SUT 環境に依存。\n"+
+			"  kill-start        : <runtime> kill → (delay) → <runtime> start。\n"+
+			"  restart           : <runtime> restart -t N。\n"+
+			"  systemctl-kill    : systemctl kill -s SIGKILL <unit>。unit の Restart= に依存。\n"+
+			"  systemctl-restart : systemctl restart <unit>。systemd が atomic に行う。\n"+
+			"  oci-restart       : <oci-runtime> delete --force → run --detach。daemon/CLI ラッパー無し。")
 	killStartDelay := fs.Duration("kill-start-delay", 0, "kill-start モードで kill 後 start までに入れる遅延")
 	restartGrace := fs.Duration("restart-grace", 0, "restart モードの SIGTERM grace (docker restart -t)")
 	_ = fs.Parse(args)
@@ -123,6 +129,15 @@ func runPhase0(args []string) {
 		inj = injector.NewContainerKillStart(rt, *container, *killStartDelay)
 	case "restart":
 		inj = injector.NewContainerRestart(rt, *container, *restartGrace)
+	case "systemctl-kill":
+		inj = injector.NewSystemctlKill(*unitName, *systemdUser)
+	case "systemctl-restart":
+		inj = injector.NewSystemctlRestart(*unitName, *systemdUser)
+	case "oci-restart":
+		if *ociBundle == "" {
+			log.Fatalf("--oci-bundle required for oci-restart injector")
+		}
+		inj = injector.NewOCIRestart(*ociRuntime, *ociID, *ociBundle, *ociDelay)
 	default:
 		log.Fatalf("unknown --injector: %s", *injectorMode)
 	}

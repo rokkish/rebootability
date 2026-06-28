@@ -1,0 +1,12 @@
+[Unit]
+Description=rebootbench tinyserver SUT
+
+[Service]
+# Replace ABSOLUTE_PATH_TO_TINYSERVER before installing.
+ExecStart=ABSOLUTE_PATH_TO_TINYSERVER
+Restart=always
+RestartSec=0
+Environment=LISTEN_ADDR=:18080
+
+[Install]
+WantedBy=default.target

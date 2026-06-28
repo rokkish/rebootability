@@ -142,6 +142,44 @@ Phase 1 以降では `--cooldown` の感度分析を入れる価値あり (plan 
 - **state を持つ SUT (postgres) の測定** はまだ未着手 (HTTP probe しか持っていない)。
   Phase 2 の data probe と合わせて TCP/プロトコル probe を作る必要がある。
 
+## Phase 0.5: cooldown 感度分析
+
+cooldown を 1s / 2s / 3s / 5s / 8s と変えて、各 30 trial を `restart` モードで計測
+(他の条件は固定: interval=10ms, pre-settle=800ms, post-settle=300ms, grace=0)。
+スクリプトは `experiments/cooldown_sweep.sh`。
+
+### 結果
+
+| cooldown | 完走率 | min ms | avg ms | max ms |
+|---|---:|---:|---:|---:|
+| 1s | 17/30 = **57%** | 1210 | 1425 | 1689 |
+| 2s | 18/30 = **60%** | 1229 | 1559 | 1788 |
+| 3s | 24/30 = **80%** | 1279 | 1579 | 1739 |
+| 5s | 30/30 = **100%** | 1219 | 1538 | 1619 |
+| 8s | 30/30 = **100%** | 1229 | 1527 | 1690 |
+
+### 観察
+
+1. **完走率は cooldown=3〜5s の間で急上昇** (sigmoid 的)。Docker daemon + WSL2 の
+   組合せでは、5 秒の cooldown が「次の kill が前回の再起動と干渉しなくなる」閾値。
+2. **完走 trial の recovery time 自体は cooldown にほぼ依存しない** (~1.5s)。
+   = 「復活時間そのもの」と「benchmark の安定実行に必要な間隔」は別物。
+3. **短い cooldown では avg recovery が小さく見える** (1s で 1425ms, 5s で 1538ms)。
+   これは選択バイアス: 早く戻る trial だけが pre-settle を通り、遅い trial は
+   `pre_settle_failed` で recovery 統計から消えるため。**ベンチマーク数字を
+   読むときは完走率も併記しないと誤誘導する**。
+
+### 含意
+
+- ベンチマークの「報告すべき数字」は (cooldown, 完走率, recovery 統計) の 3 つ組
+  で意味を持つ。
+- Phase 1 以降の SUT 比較では「等しい cooldown かつ等しく 100% 完走の領域」で
+  比較する、もしくは「100% 完走に必要な最小 cooldown」自体を比較軸にする選択肢
+  もある。後者は「環境の再起動連続耐性」を捉える独立の指標になり得る。
+- Recovery Time (RT) 単一指標で SUT を順位付けることの危うさが、Phase 0.5 で
+  実機データとして可視化された。これは plan の RT/DI/BR/RC の **4 軸スコア化**
+  (Phase 3) を急ぐ動機になる。
+
 ## 完了基準チェック (plan 0.10)
 
 - [x] `rebootbench phase0` コマンドが動く

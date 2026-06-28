@@ -61,6 +61,16 @@ func runPhase0(args []string) {
 	csvPath := fs.String("csv", "", "optional path to write recovery times CSV (default <db_dir>/<experiment_id>.csv)")
 	notes := fs.String("notes", "", "free-form notes saved with the experiment")
 	gitSHA := fs.String("git-sha", "", "git SHA of rebootbench at run time (informational)")
+	injectorMode := fs.String("injector", "kill-start",
+		"injection mode: kill | kill-start | restart\n"+
+			"  kill        : docker kill のみ。復活は SUT 環境に依存。\n"+
+			"                自動復活がなければ status=no_recovery を記録する。\n"+
+			"  kill-start  : docker kill 直後に外部から docker start を発行。\n"+
+			"                突然死 + 外部観察者の即時再起動命令を測る。\n"+
+			"  restart     : docker restart -t N (SIGTERM→grace→SIGKILL→start)。\n"+
+			"                計画的再起動のコストを測る。")
+	killStartDelay := fs.Duration("kill-start-delay", 0, "kill-start モードで kill 後 start までに入れる遅延")
+	restartGrace := fs.Duration("restart-grace", 0, "restart モードの SIGTERM grace (docker restart -t)")
 	_ = fs.Parse(args)
 
 	rec, err := recorder.Open(*dbPath)
@@ -83,7 +93,7 @@ func runPhase0(args []string) {
 	if err := rec.SaveExperiment(expRow); err != nil {
 		log.Fatalf("save experiment: %v", err)
 	}
-	log.Printf("experiment %s started: container=%s url=%s trials=%d interval=%s", expID, *container, *url, *trials, *interval)
+	log.Printf("experiment %s started: container=%s url=%s trials=%d interval=%s injector=%s", expID, *container, *url, *trials, *interval, *injectorMode)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -94,6 +104,18 @@ func runPhase0(args []string) {
 		log.Printf("signal received, cancelling experiment")
 		cancel()
 	}()
+
+	var inj injector.Injector
+	switch *injectorMode {
+	case "kill":
+		inj = injector.NewDockerKill(*container)
+	case "kill-start":
+		inj = injector.NewDockerKillStart(*container, *killStartDelay)
+	case "restart":
+		inj = injector.NewDockerRestart(*container, *restartGrace)
+	default:
+		log.Fatalf("unknown --injector: %s", *injectorMode)
+	}
 
 	runner := &experiment.Runner{
 		Cfg: experiment.Config{
@@ -109,7 +131,7 @@ func runPhase0(args []string) {
 		},
 		ExperimentID: expID,
 		Recorder:     rec,
-		Injector:     injector.NewDockerKill(*container),
+		Injector:     inj,
 	}
 
 	for i := 0; i < *trials; i++ {

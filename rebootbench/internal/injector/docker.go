@@ -3,49 +3,98 @@ package injector
 import (
 	"context"
 	"fmt"
-	"log"
 	"os/exec"
 	"time"
 )
 
+// DockerKill : 純粋な kill。回復は SUT 環境 (restart policy / supervisor) 任せ。
+// 何も再起動しなければ recovery は来ない — それが測定結果。
 type DockerKill struct {
 	Container string
 	Signal    string // e.g. "SIGKILL"; empty -> docker default (SIGKILL)
-	// AutoStart: if true, fire `docker start` asynchronously right after kill.
-	// On Docker 29.x we observed that `--restart=always` does NOT trigger a
-	// restart after `docker kill`, so the external observer must request the
-	// restart explicitly. Default true.
-	AutoStart bool
 }
 
 func NewDockerKill(container string) *DockerKill {
-	return &DockerKill{Container: container, AutoStart: true}
+	return &DockerKill{Container: container}
 }
 
-// Inject runs `docker kill <container>` and returns the wall-clock time
-// immediately before the command was invoked. The timestamp is taken before
-// exec so that it approximates "when the kill was requested" rather than
-// "when the docker CLI returned".
-func (d *DockerKill) Inject(ctx context.Context) (time.Time, error) {
+func (d *DockerKill) Mode() string { return "kill" }
+
+func (d *DockerKill) Inject(ctx context.Context) (Event, error) {
 	args := []string{"kill"}
 	if d.Signal != "" {
 		args = append(args, "-s", d.Signal)
 	}
 	args = append(args, d.Container)
 	at := time.Now()
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return at, fmt.Errorf("docker kill failed: %w: %s", err, string(out))
+	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		return Event{InjectAt: at, Mode: d.Mode()}, fmt.Errorf("docker kill: %w: %s", err, string(out))
 	}
-	if d.AutoStart {
-		go func(name string) {
-			// detached from trial context: we want the start to happen even
-			// if the trial loop moves on
-			out, err := exec.Command("docker", "start", name).CombinedOutput()
-			if err != nil {
-				log.Printf("docker start %s: %v: %s", name, err, string(out))
-			}
-		}(d.Container)
+	return Event{InjectAt: at, Mode: d.Mode()}, nil
+}
+
+// DockerKillStart : kill 直後に (オプションで遅延を入れて) 外部から start を発行する。
+// 「突然死 + 外部観察者が即時に再起動命令」というシナリオを測る。
+// recovery_time = first_200 - inject_at は「kill から最初の 200 まで」だが、
+// start_at も別途記録するので分解分析できる。
+type DockerKillStart struct {
+	Container string
+	Signal    string
+	Delay     time.Duration // kill 後に start を打つまでの待ち時間
+}
+
+func NewDockerKillStart(container string, delay time.Duration) *DockerKillStart {
+	return &DockerKillStart{Container: container, Delay: delay}
+}
+
+func (d *DockerKillStart) Mode() string { return "kill-start" }
+
+func (d *DockerKillStart) Inject(ctx context.Context) (Event, error) {
+	args := []string{"kill"}
+	if d.Signal != "" {
+		args = append(args, "-s", d.Signal)
 	}
-	return at, nil
+	args = append(args, d.Container)
+	at := time.Now()
+	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		return Event{InjectAt: at, Mode: d.Mode()}, fmt.Errorf("docker kill: %w: %s", err, string(out))
+	}
+	if d.Delay > 0 {
+		select {
+		case <-time.After(d.Delay):
+		case <-ctx.Done():
+			return Event{InjectAt: at, Mode: d.Mode()}, ctx.Err()
+		}
+	}
+	startAt := time.Now()
+	if out, err := exec.CommandContext(ctx, "docker", "start", d.Container).CombinedOutput(); err != nil {
+		return Event{InjectAt: at, StartAt: startAt, Mode: d.Mode()},
+			fmt.Errorf("docker start: %w: %s", err, string(out))
+	}
+	return Event{InjectAt: at, StartAt: startAt, Mode: d.Mode()}, nil
+}
+
+// DockerRestart : `docker restart -t N` を呼ぶ。SIGTERM → grace → SIGKILL → start を
+// daemon が atomic に行う「計画的再起動」のコストを測る。
+type DockerRestart struct {
+	Container string
+	StopGrace time.Duration // -t に渡す秒数。0 で即 SIGKILL
+}
+
+func NewDockerRestart(container string, stopGrace time.Duration) *DockerRestart {
+	return &DockerRestart{Container: container, StopGrace: stopGrace}
+}
+
+func (d *DockerRestart) Mode() string { return "restart" }
+
+func (d *DockerRestart) Inject(ctx context.Context) (Event, error) {
+	secs := int(d.StopGrace.Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	at := time.Now()
+	if out, err := exec.CommandContext(ctx, "docker", "restart", "-t", fmt.Sprintf("%d", secs), d.Container).CombinedOutput(); err != nil {
+		return Event{InjectAt: at, Mode: d.Mode()}, fmt.Errorf("docker restart: %w: %s", err, string(out))
+	}
+	return Event{InjectAt: at, Mode: d.Mode()}, nil
 }

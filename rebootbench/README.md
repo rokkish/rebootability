@@ -48,6 +48,19 @@ docker run -d --name rebootbench-nginx --restart=always -p 18080:80 nginx:alpine
 | `--recovery-timeout` | `30s` | 復活待ちの上限 |
 | `--db` | `rebootbench.db` | SQLite ファイル |
 | `--csv` | (自動) | recovery_time の CSV 出力先 |
+| `--injector` | `kill-start` | 注入モード (下記参照) |
+| `--kill-start-delay` | `0` | `kill-start` モードで kill 後 start までの遅延 |
+| `--restart-grace` | `0` | `restart` モードの SIGTERM grace (`docker restart -t`) |
+
+## 注入モード (`--injector`)
+
+| モード | 何を測っているか | plan の軸 | 備考 |
+|---|---|---|---|
+| `kill` | SUT 環境 (restart policy / supervisor / k8s) の自己復活力 + SUT 起動コスト | RT | 自動復活が無ければ `status=no_recovery` を残す (それも測定結果) |
+| `kill-start` | 突然死 + 外部観察者の即時 (or 遅延 `--kill-start-delay`) 再起動命令 + SUT 起動コスト | RT (検知 + 操作 + 起動) | `start_at` を別途記録するので分解分析できる |
+| `restart` | `docker restart -t N` — daemon が SIGTERM→grace→SIGKILL→start を atomic に行う「計画的再起動」のコスト | RC (Restart Cost) | grace=0 で即 SIGKILL → start |
+
+「何を測るか」によってモードを選ぶこと。観察者が `start` を打つことを Injector に含めると、SUT 単独のレジリエンスを測っているのか、観察者の反応も含めた合成測定なのか混同するため、明示的に分けている。
 
 ## 出力
 
@@ -64,13 +77,14 @@ docker run -d --name rebootbench-nginx --restart=always -p 18080:80 nginx:alpine
 
 ## 既知の制約 (Phase 0)
 
-- docker のみ対応 (Phase 1 で injector 抽象化)
+- docker のみ対応 (Phase 1 で k8s injector などへ抽象化)
 - HTTP probe のみ (Phase 2 で data integrity probe)
 - recorder は同一ホスト (Phase 1 でリモート対応)
 - 集計は手動分析前提 (Phase 4 で自動化)
-- **Docker 29.x で `--restart=always` が `docker kill` 後に発火しない**ため、
-  injector は kill 直後に非同期で `docker start` を発行する。
-  「外部観察者が直ちに再起動を試みる」シナリオの計測となる。
+- **Docker 29.x で `--restart=always` が `docker kill` 後に発火しない**
+  (`restart_count=0` のまま Exited 状態が続く)。`--injector kill` を使った場合、
+  これが「環境の自己復活力ゼロ」として `status=no_recovery` で記録される。
+  実用上は `kill-start` か `restart` を使う。
 
 ## 実験結果
 

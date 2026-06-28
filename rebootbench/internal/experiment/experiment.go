@@ -27,7 +27,7 @@ type Runner struct {
 	Cfg          Config
 	ExperimentID string
 	Recorder     *recorder.Recorder
-	Injector     *injector.DockerKill
+	Injector     injector.Injector
 }
 
 // RunTrial executes one inject + observe cycle and persists results incrementally.
@@ -63,28 +63,41 @@ func (r *Runner) RunTrial(ctx context.Context, idx int) (recorder.TrialRow, erro
 			}
 		}
 	}
+	mode := r.Injector.Mode()
 	if !gotPreOK {
-		row := recorder.TrialRow{ExperimentID: r.ExperimentID, Index: idx, InjectAt: time.Now(), Status: "pre_settle_failed"}
+		row := recorder.TrialRow{ExperimentID: r.ExperimentID, Index: idx, InjectorMode: mode, InjectAt: time.Now(), Status: "pre_settle_failed"}
 		_ = r.Recorder.SaveTrial(row)
 		return row, fmt.Errorf("trial %d: pre-settle saw no 200", idx)
 	}
 
 	// 2. inject
-	injectAt, err := r.Injector.Inject(ctx)
+	ev, err := r.Injector.Inject(ctx)
 	if err != nil {
-		row := recorder.TrialRow{ExperimentID: r.ExperimentID, Index: idx, InjectAt: injectAt, Status: "inject_failed"}
+		row := recorder.TrialRow{ExperimentID: r.ExperimentID, Index: idx, InjectorMode: mode, InjectAt: ev.InjectAt, StartAt: ev.StartAt, Status: "inject_failed"}
 		_ = r.Recorder.SaveTrial(row)
 		return row, err
 	}
+	injectAt := ev.InjectAt
 
-	// 3. wait for recovery: first 200 with SentAt >= injectAt
+	// 3. wait for recovery.
+	// 注意: 「inject 後に最初の 200」だけだと、`docker kill` CLI が返るまでの
+	// 数百ms間に SUT がまだ生きていて 200 を返してしまうため、それを誤って
+	// recovery と判定する。これを防ぐため、recovery = "inject 後に少なくとも
+	// 1 回失敗 (err or non-2xx) を観測した後の、最初の 200" と定義する。
 	recoveryDeadline := injectAt.Add(r.Cfg.PostTimeout)
 	var firstRecoveryAt time.Time
+	sawFailure := false
 	for firstRecoveryAt.IsZero() {
 		if time.Now().After(recoveryDeadline) {
-			row := recorder.TrialRow{ExperimentID: r.ExperimentID, Index: idx, InjectAt: injectAt, Status: "timeout"}
+			status := "timeout"
+			// kill モードで自動復活がない環境では、これは「環境の自己復活力ゼロ」という
+			// 計測結果。後段の分析が区別できるよう専用ステータスを残す。
+			if mode == "kill" {
+				status = "no_recovery"
+			}
+			row := recorder.TrialRow{ExperimentID: r.ExperimentID, Index: idx, InjectorMode: mode, InjectAt: injectAt, StartAt: ev.StartAt, Status: status}
 			_ = r.Recorder.SaveTrial(row)
-			return row, fmt.Errorf("trial %d: recovery timeout", idx)
+			return row, fmt.Errorf("trial %d: %s", idx, status)
 		}
 		select {
 		case <-ctx.Done():
@@ -94,7 +107,14 @@ func (r *Runner) RunTrial(ctx context.Context, idx int) (recorder.TrialRow, erro
 				return recorder.TrialRow{}, fmt.Errorf("probe channel closed during recovery wait")
 			}
 			saveAndCheck(p)
-			if p.Err == nil && p.StatusCode == 200 && !p.SentAt.Before(injectAt) {
+			if p.SentAt.Before(injectAt) {
+				continue
+			}
+			if p.Err != nil || p.StatusCode != 200 {
+				sawFailure = true
+				continue
+			}
+			if sawFailure {
 				firstRecoveryAt = p.SentAt
 			}
 		}
@@ -117,7 +137,9 @@ func (r *Runner) RunTrial(ctx context.Context, idx int) (recorder.TrialRow, erro
 	row := recorder.TrialRow{
 		ExperimentID:    r.ExperimentID,
 		Index:           idx,
+		InjectorMode:    mode,
 		InjectAt:        injectAt,
+		StartAt:         ev.StartAt,
 		FirstRecoveryAt: firstRecoveryAt,
 		RecoveryTime:    firstRecoveryAt.Sub(injectAt),
 		Status:          "completed",

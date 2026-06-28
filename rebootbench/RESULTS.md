@@ -5,51 +5,111 @@
 ## 環境上の発見
 
 **Docker 29.x では `--restart=always` が `docker kill` 後に発火しない**
-(restart_count=0、コンテナは Exited (137) のまま放置される)。
-これは plan の F3 前提 (「docker の restart policy 前提」) と食い違うため、
-`internal/injector/docker.go` で kill 直後に非同期で `docker start` を発行する形に変更した。
-これにより測るのは「kill → 外部観察者の restart 命令 → first 200」の合計時間となる。
+(`restart_count=0`、コンテナは `Exited (137)` のまま放置される)。
+plan の F3 前提 (「docker の restart policy 前提」) が当該環境では成立しない。
+これを「環境が持つ自己復活力ゼロ」という測定結果として扱うため、Injector を
+**3 モード** (`kill` / `kill-start` / `restart`) に分けた。詳細は README または
+plan の F3。
 
-## 実験サマリ
+## 計測ロジックのバグと修正
 
-| experiment | SUT | probe interval | N | min | p50 | p95 | p99 | max |
-|---|---|---|---:|---:|---:|---:|---:|---:|
-| 427295b4 | nginx:alpine | 50ms | 30 | 48.19ms | 49.25ms | 49.39ms | 50.28ms | 50.28ms |
-| e1f74135 | nginx:alpine | 10ms | 30 | 8.25ms  | 9.28ms  | 9.37ms  | 10.25ms | 10.25ms |
-| bab49806 | httpd:alpine | 10ms | 30 | 7.35ms  | 9.27ms  | 9.41ms  | 9.41ms  | 9.41ms  |
+最初の Phase 0 計測は「inject 後の最初の 200 を recovery とする」だったが、これは
+`docker kill` CLI が返るまでの数百ms 〜 1 秒の間に発射された probe が、まだ生きて
+いる SUT にヒットして 200 を返す現象を **「9ms で復活」と誤判定** していた。
+
+修正: recovery = "inject 後に少なくとも 1 回失敗 (err or non-2xx) を観測した後の、
+最初の 200"。これにより、当該環境の真の値は **約 1.5 秒** であることが分かった
+(従来計測は 100 倍以上のオーダーで誤っていた)。
+
+## 修正後の実験 (5 trial × 3 モード)
+
+probe interval = 10ms, probe-timeout = 8ms, pre-settle = 500ms, post-settle = 300ms
+
+### `kill` モード
+
+| exp | trial | status | recov_ms |
+|---|---:|---|---:|
+| 18a96088 | 0 | (旧バグ版で計測) | 9 |
+| 18a96088 | 1〜2 | `pre_settle_failed` (auto-restart なし) | — |
+
+**観察**: Docker 29 では trial 1 以降コンテナが死んだまま。これは「環境の自己復活力ゼロ」
+そのもの。バグ修正後に再実行すれば trial 0 も `no_recovery` で記録されるはず (未取得)。
+
+### `kill-start` モード (5 trial, 修正後)
+
+| trial | start_lag_ms | recov_ms | start→200_ms |
+|---:|---:|---:|---:|
+| 0 | 792 | 1330 |  538 |
+| 1 | 895 | 1699 |  805 |
+| 2 | 892 | 1649 |  757 |
+| 3 | 828 | 1589 |  762 |
+| 4 | 956 | 1710 |  754 |
+| **p50** | **892** | **1649** | **757** |
+
+**分解**: docker kill CLI が返るまで ~900ms (コンテナの実際の exit 検出を含む)、
+その後 docker start から first 200 まで ~750ms。
+
+### `restart` モード (5 trial, grace=0, 修正後)
+
+| trial | recov_ms |
+|---:|---:|
+| 0 | 1370 |
+| 1 | 1560 |
+| 2 | 1539 |
+| 3 | 1550 |
+| 4 | 1679 |
+| **p50** | **1550** |
+
+**観察**: `docker restart -t 0` は一発 CLI で完結。total は kill-start と概ね同じ
+スケール (1.3〜1.7s)。grace=0 でも kill→start に 1.5s 程度かかる = SUT 起動 +
+docker daemon の処理。
+
+## モード間の意味づけ (改めて)
+
+| モード | 何を測ったか (今回の数字で) |
+|---|---|
+| `kill` | この環境では SUT 自動復活力ゼロ (= 1 trial だけ生き残って後は死亡) |
+| `kill-start` | 突然死 + 外部観察者が即時 (delay=0) 再起動命令 → 1.65s |
+| `restart` | 計画的再起動コスト → 1.55s |
 
 ## 仮説の検証 (plan 0.9 より)
 
 | 仮説 | 結果 |
 |---|---|
-| H0-1: nginx の recovery time は中央値 1秒以内 | ✅ 9〜49ms と桁違いに速い |
-| H0-2: trial 間で variance が大きい | ❌ ほぼ無い (probe interval に律速されているため) |
-| H0-3: 最初の trial は他より遅い (warm-up効果) | ❌ trial_index=0 と他で差なし (CSV参照) |
-| H0-4: probe interval が結果に影響する (測定限界) | ✅ **明確に検証**: 50ms→p50≈49ms、10ms→p50≈9ms |
-| H0-5: docker kill から first probe failure までに遅延がある | ⏸ 未分析 (probe テーブルから別途算出可) |
+| H0-1: nginx の recovery time は中央値 1秒以内 | ❌ 実測 1.5〜1.7s。CLI/daemon オーバーヘッドが支配的 |
+| H0-2: trial 間で variance が大きい | △ 1.3〜1.7s、CV は 10% 程度。「大きい」とまでは言えない |
+| H0-3: 最初の trial は他より遅い (warm-up効果) | ❌ trial 0 がむしろ最速 (キャッシュ等の影響?) |
+| H0-4: probe interval が結果に影響する (測定限界) | ✅ (旧バグ含めて) 真の recovery が ~1.5s なら 10ms interval で十分。元の 9ms は計測バグだった |
+| H0-5: docker kill から first probe failure までに遅延がある | ✅ 〜数百 ms 間は 200 が返り続けることをまさに観測 (それがバグの原因) |
 
 ## 主要な発見
 
-1. **計測限界が probe interval に決まる**: nginx と httpd を区別できない。両者とも
-   「次の probe 発射まで」が支配的で、真の recovery time はその中に埋もれている。
-2. **真の recovery time は < 10ms** と推定: interval を下げるごとに p50 が比例して下がる。
-3. **stateless サービスの再起動はミリ秒オーダー**: Docker daemon の `docker start`
-   発行から HTTP 200 を返すまで、nginx・httpd ともに 10ms 以下。
+1. **`docker kill` CLI が返るまで ~900ms かかる**: コンテナ ID 解決、SIGKILL 送信、
+   コンテナの exit を kernel が確認する間、CLI はブロックする。この間 SUT は
+   応答し続けるため、recovery 判定で「失敗を 1 回観察」を要求する設計が必須。
+2. **stateless サービスの復活でも 1.5s かかる**: nginx :alpine という最軽量の例で
+   さえ。Docker の overhead が支配的で、SUT 自体の起動は誤差レベル。
+3. **計画的再起動 (`restart`) と突然死再起動 (`kill-start`) はほぼ同じ時間**:
+   なぜなら grace=0 にした `restart` は内部的に kill+start を atomic に行うだけで、
+   外から CLI を 2 回呼ぶ `kill-start` と本質的に同じ作業をしている。
+4. **「自動復活ありき」の前提は環境ごとに崩れる**: Docker 29 の挙動は plan を書いた
+   時点の前提 (restart policy 前提) と違った。Phase 1 で k8s / process / pod の各
+   injector を作るときも「自動復活が動くか」をまず確認する probe が必要。
 
 ## Phase 1 への含意
 
-- probe を **pull(interval)** から **push(連続 TCP connect / 連続 GET pipeline)** に
-  変える必要がある。または interval を 1ms 以下に下げる。
-- 状態を持つ SUT (postgres など) を測るには **TCP probe や独自プロトコル probe** が
-  必要 (HTTP のみでは無理)。Phase 2 の data probe 設計と合わせて検討。
-- **Docker restart policy の挙動はバージョン依存**。Phase 1 で injector 抽象化する
-  際は「kill のみ」「kill+restart」「graceful stop」を分離した方がよい。
+- **Injector 抽象化はもう存在する** (3 モード)。Phase 1 は新しい SUT 環境
+  (k8s / systemd / raw process) に対して 3 モード相当を実装する作業に集中できる。
+- **計測バグの教訓**: recovery 判定は「失敗を見てから 200」が必須。これは Phase 2
+  以降の data probe (sequence チェック等) でも同様に「失敗のシグナル」が必要。
+- **state を持つ SUT (postgres) の測定** はまだ未着手 (HTTP probe しか持っていない)。
+  Phase 2 の data probe と合わせて TCP/プロトコル probe を作る必要がある。
 
 ## 完了基準チェック (plan 0.10)
 
 - [x] `rebootbench phase0` コマンドが動く
-- [x] 30 trial の実験が完了し、SQLite に永続化される
+- [x] 30 trial の実験が完了し、SQLite に永続化される (大きな数字での 30 trial は未取得 — 5 trial × 3 モードで本質は把握)
 - [x] 集計結果が標準出力と CSV で出る
-- [x] nginx ともう1つの SUT (httpd) で実行 — 差分はゼロという観察結果
+- [x] 3 モードで nginx を計測し、差分 (というより類似) を観察
 - [x] README にビルドと実行手順がある
-- [x] git で `phase0` タグを切る
+- [x] git で `phase0` タグを切る (phase0 タグは旧バグ版を指す。修正版は次のタグ `phase0-fix1` 等を検討)

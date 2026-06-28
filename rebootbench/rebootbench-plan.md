@@ -91,9 +91,18 @@
 - probe 自身のオーバーヘッドを最小化 (Go の `net/http` を直接使い、keepalive ON)
 
 ### F3: Injector
-- `docker kill <container>` を実行
-- 注入時刻 (UTC, nanoseconds) を記録
-- 注入後、コンテナが自動再起動するのを待つ (docker の restart policy 前提)
+- **3 モードを提供する** (`--injector`):
+  - `kill`: `docker kill` のみ。回復は SUT 環境任せ。自動復活がなければ
+    `status=no_recovery` を残す。**測りたい軸: RT (環境の自己復活力)**
+  - `kill-start`: `docker kill` 直後に外部から `docker start` を発行 (任意の遅延あり)。
+    `inject_at` と `start_at` を別に記録する。**測りたい軸: RT (検知+操作+起動)**
+  - `restart`: `docker restart -t N` を呼ぶ (SIGTERM → grace → SIGKILL → start を
+    daemon が atomic に実行)。**測りたい軸: RC (計画的再起動コスト)**
+- 注入時刻 (UTC, nanoseconds) を記録 — モードによって 1〜2 個のタイムスタンプ
+- 当初の計画は「`docker kill` 1 種 + restart policy 前提」だったが、Docker 29.x で
+  `--restart=always` が `docker kill` 後に発火しないことを実機で発見したため、
+  プラン段階で観察者の責務を「kill のみ」と「kill + 再起動命令」に明示的に分けた。
+  これは「観察者が SUT に対して何をしているか」を測定セマンティクスに繰り込むため。
 
 ### F4: Trial 制御
 - 1 trial = (probe開始) → (定常確認) → (inject) → (復活検出) → (定常確認) → (probe停止)
@@ -133,10 +142,12 @@ CREATE TABLE experiment (
 CREATE TABLE trial (
     experiment_id TEXT NOT NULL,
     trial_index INTEGER NOT NULL,
-    inject_at INTEGER NOT NULL,             -- Unix nanoseconds
+    injector_mode TEXT NOT NULL,            -- "kill" / "kill-start" / "restart"
+    inject_at INTEGER NOT NULL,             -- Unix nanoseconds (停止操作の起点)
+    start_at INTEGER,                       -- kill-start モードのみ。外部 start 発行時刻
     first_recovery_at INTEGER,              -- 最初の200応答の時刻
     recovery_time_ns INTEGER,               -- first_recovery_at - inject_at
-    status TEXT NOT NULL,                   -- "completed", "failed", "timeout"
+    status TEXT NOT NULL,                   -- "completed" / "no_recovery" / "timeout" / "pre_settle_failed" / "inject_failed"
     PRIMARY KEY (experiment_id, trial_index)
 );
 

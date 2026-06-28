@@ -49,6 +49,20 @@ probe interval = 10ms, probe-timeout = 8ms, pre-settle = 500ms, post-settle = 30
 **分解**: docker kill CLI が返るまで ~900ms (コンテナの実際の exit 検出を含む)、
 その後 docker start から first 200 まで ~750ms。
 
+### `restart` モード (30 trial, cooldown=5s, pre-settle=800ms, grace=0) — 本実験
+
+| 統計 | 値 |
+|---|---:|
+| N (completed) | 29/30 |
+| min  | 1.459s |
+| p50  | 1.560s |
+| mean | 1.582s |
+| p95  | 1.680s |
+| p99  | 1.969s |
+| max  | 1.969s |
+
+(experiment `0e02ef27`)
+
 ### `restart` モード (5 trial, grace=0, 修正後)
 
 | trial | recov_ms |
@@ -82,6 +96,27 @@ docker daemon の処理。
 | H0-4: probe interval が結果に影響する (測定限界) | ✅ (旧バグ含めて) 真の recovery が ~1.5s なら 10ms interval で十分。元の 9ms は計測バグだった |
 | H0-5: docker kill から first probe failure までに遅延がある | ✅ 〜数百 ms 間は 200 が返り続けることをまさに観測 (それがバグの原因) |
 
+## バーストエラー: 短い cooldown で Docker が縮退
+
+`cooldown=2s, pre-settle=500ms` の最初の 30 trial 実験 (`restart` モード) は **15/30**
+しか完走しなかった。失敗パターンは**バースト的** (例: trial 0,1,2 失敗 → 3-13 成功
+→ 14-23 連続 10 失敗 → 24-29 復活)。
+
+失敗 trial の probe を見ると、pre-settle 中の全 50 probe (500ms / 10ms) が
+**`read: connection reset by peer`** を返している。docker-proxy のポートは生きて
+いる (TCP SYN/ACK は通る → latency 1-1.5ms で即 reset) が、nginx 自体がまだ
+正常応答できない、という状態が 500ms 以上続く。
+
+`cooldown=5s, pre-settle=800ms` に伸ばすと 29/30 完走。**rapid kill cycle で Docker
+の再起動メカニズムが縮退する**ことが分かった。意味としては:
+
+- ベンチマークとして、cooldown が短すぎると **SUT 由来でない**追加遅延が混入する
+- 逆に長い cooldown を要する事実そのものが、SUT (or 環境) のレジリエンス特性の
+  1 指標になり得る — 「N 秒以内に連続再起動すると壊れる」
+
+Phase 1 以降では `--cooldown` の感度分析を入れる価値あり (plan 0.12 の意思決定
+ポイント「次に何を測りたいか」に対する具体的な答えの一つ)。
+
 ## 主要な発見
 
 1. **`docker kill` CLI が返るまで ~900ms かかる**: コンテナ ID 解決、SIGKILL 送信、
@@ -95,6 +130,8 @@ docker daemon の処理。
 4. **「自動復活ありき」の前提は環境ごとに崩れる**: Docker 29 の挙動は plan を書いた
    時点の前提 (restart policy 前提) と違った。Phase 1 で k8s / process / pod の各
    injector を作るときも「自動復活が動くか」をまず確認する probe が必要。
+5. **rapid kill cycle で Docker が縮退する** (上節)。ベンチマーク自体の感度分析
+   軸として `cooldown` が浮上。
 
 ## Phase 1 への含意
 
@@ -108,7 +145,7 @@ docker daemon の処理。
 ## 完了基準チェック (plan 0.10)
 
 - [x] `rebootbench phase0` コマンドが動く
-- [x] 30 trial の実験が完了し、SQLite に永続化される (大きな数字での 30 trial は未取得 — 5 trial × 3 モードで本質は把握)
+- [x] 30 trial の実験が完了し、SQLite に永続化される (restart モード 29/30 完走, experiment `0e02ef27`)
 - [x] 集計結果が標準出力と CSV で出る
 - [x] 3 モードで nginx を計測し、差分 (というより類似) を観察
 - [x] README にビルドと実行手順がある

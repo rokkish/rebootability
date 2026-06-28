@@ -68,6 +68,9 @@ func runPhase0(args []string) {
 	ociID := fs.String("oci-id", "rebootbench-oci", "OCI container id (used by oci-restart)")
 	ociBundle := fs.String("oci-bundle", "", "OCI bundle dir path (used by oci-restart)")
 	ociDelay := fs.Duration("oci-delay", 0, "OCI delete→run の間に挟む遅延")
+	k8sNamespace := fs.String("k8s-namespace", "default", "k8s namespace (used by k8s-delete-pod)")
+	k8sSelector := fs.String("k8s-selector", "app=rebootbench-tiny", "k8s label selector (used by k8s-delete-pod)")
+	k8sGrace := fs.Int("k8s-grace", 0, "kubectl delete pod --grace-period")
 	injectorMode := fs.String("injector", "kill-start",
 		"injection mode: kill | kill-start | restart | systemctl-kill | systemctl-restart | oci-restart\n"+
 			"  kill              : <runtime> kill のみ。復活は SUT 環境に依存。\n"+
@@ -75,7 +78,9 @@ func runPhase0(args []string) {
 			"  restart           : <runtime> restart -t N。\n"+
 			"  systemctl-kill    : systemctl kill -s SIGKILL <unit>。unit の Restart= に依存。\n"+
 			"  systemctl-restart : systemctl restart <unit>。systemd が atomic に行う。\n"+
-			"  oci-restart       : <oci-runtime> delete --force → run --detach。daemon/CLI ラッパー無し。")
+			"  oci-restart       : <oci-runtime> delete --force → run --detach。daemon/CLI ラッパー無し。\n"+
+			"  k8s-delete-pod    : kubectl delete pod -l <selector> --grace-period=N (--force when 0)。\n"+
+			"                      Deployment/ReplicaSet が新 pod を作成 + Service endpoint 反映を測る。")
 	killStartDelay := fs.Duration("kill-start-delay", 0, "kill-start モードで kill 後 start までに入れる遅延")
 	restartGrace := fs.Duration("restart-grace", 0, "restart モードの SIGTERM grace (docker restart -t)")
 	_ = fs.Parse(args)
@@ -138,6 +143,10 @@ func runPhase0(args []string) {
 			log.Fatalf("--oci-bundle required for oci-restart injector")
 		}
 		inj = injector.NewOCIRestart(*ociRuntime, *ociID, *ociBundle, *ociDelay)
+	case "k8s-delete-pod":
+		k8s := injector.NewK8sDeletePod(*k8sNamespace, *k8sSelector)
+		k8s.GracePeriod = *k8sGrace
+		inj = k8s
 	default:
 		log.Fatalf("unknown --injector: %s", *injectorMode)
 	}

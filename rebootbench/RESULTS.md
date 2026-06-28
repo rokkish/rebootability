@@ -321,6 +321,80 @@ shell でも `./rebootbench ... | tail -15` がハングする同じ問題が起
 - 次は **C: k8s pod restart** (plan §2.1) を実装すれば 5 層目が乗り、
   「orchestrator がさらに何 ms 乗せるか」が定量化できる。
 
+## Phase 2: 5 層目 — k8s pod restart
+
+Phase 0.7 の 4 層比較に **kubernetes** を加えた 5 層目。
+環境: k3d (k3s in docker) v1.30.4, single node, container runtime = containerd
++ runc。SUT は同じ `tinyserver` image。
+
+### 設計
+
+- `Deployment(replicas=1)` + `Service(NodePort 30080→host 18080)`
+- Injector: `kubectl get pod -l <selector> -o jsonpath...` で pod 名解決 →
+  `kubectl delete pod <name> --grace-period=0 --force --wait=false`
+- recovery = probe が 200 を返すまで (= ReplicaSet が新 pod 作成 → Service の
+  Endpoints が反映 → kube-proxy / iptables が新 endpoint を pickup → 新 pod
+  が応答)
+- 感度分析: `readinessProbe` の有無で 2 設定
+
+### 結果 (20 trial × 2 設定)
+
+| 設定 | min ms | p50 ms | p95 ms | p99 ms | 完走率 |
+|---|---:|---:|---:|---:|---:|
+| no readinessProbe | 1710 | **2230** | 2525 | 3406 | 20/20 |
+| readinessProbe (period=1s) | 1913 | **2751** | 3379 | 3566 | 20/20 |
+
+### Figure 1 (5 層比較、p50 ms)
+
+```
+delay 差引 p50 ms (lower is better)
+ 0      500     1000   1500   2000   2500   3000
+ |------|-------|------|------|------|------|
+ |#| 35                                          systemd --user
+ |#| 36                                          crun direct
+ |##| 157                                        runc direct
+ |#####################| 827                     podman rootless
+ |######################################| 1565   docker
+ |######################################################| 2230  k8s (no readiness)
+ |#############################################################| 2751 k8s (readinessProbe period=1s)
+```
+
+### 観察
+
+1. **k8s は docker より +665ms 遅い**。docker は CLI → daemon → containerd →
+   runc の 4 段。k3d の k8s は kubectl → API server → controller manager →
+   scheduler → kubelet → containerd → runc の 7 段。control plane の
+   reconciliation loop (etcd write、watch event 配信、Endpoints update、
+   kube-proxy iptables 更新) がこの 665ms を構成する。
+2. **readinessProbe で +520ms**。periodSeconds=1 が下限を作る。kubelet は
+   container running の瞬間に probe を始めるが、最初の check は次の period
+   境界 (= 平均 500ms 後)。これが直接 endpoint 更新を遅延させる。
+3. **p99 のテールが docker (1.86s) → k8s no-readiness (3.41s) で 1.5s 拡大**。
+   k8s の reconcile loop は確率的なジッタを持ち込む (scheduler の delay、
+   Endpoints controller の batching、kube-proxy の sync 周期)。テールが
+   太いことが本質的にレジリエンスのリスク。
+4. **オーケストレータが追加するのは平均値より tail**。可用性 SLA はテール
+   律速なので、p99 比較が重要。
+
+### Phase 2 §2.1 完了基準チェック
+
+- [x] kind/k3d で tinyserver Service が 200 を返す
+- [x] 20 trial で kubectl delete pod を打ち、復活時間を計測
+- [x] 4 層比較に 5 層目を追加した figure
+- [x] readinessProbe 有無の感度分析
+
+### Phase 3 への含意
+
+5 層が出揃ったので **同じ SUT に対する RT 軸の階層分布** は把握できた。次に
+plan の 4 軸 (RT/DI/BR/RC) のうち RT 以外を測る価値が出てくる:
+
+- **BR (Blast Radius)**: 1 pod を kill した時、他の pod (例: replicas=3 の
+  うち 1 個) はどう影響を受けるか。残り 2 pod の latency は劣化するか?
+- **DI (Data Integrity)**: 状態を持つ SUT (postgres replica など) で kill
+  すると、復活後にデータが残るか / order が保たれるか。
+- **RC (Restart Cost)**: planned restart (`kubectl rollout restart`) vs
+  unplanned kill のコスト差。
+
 ## 完了基準チェック (plan 0.10)
 
 - [x] `rebootbench phase0` コマンドが動く

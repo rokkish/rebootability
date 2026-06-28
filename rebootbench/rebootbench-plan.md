@@ -421,11 +421,16 @@ bare → OCI runtime → container CLI → daemon の 4 層は計測済み (RESU
   - Service の `publishNotReadyAddresses`
   - kube-proxy の更新頻度 (iptables / ipvs)
 
-**Phase 2 完了基準**:
-- [ ] kind cluster で tinyserver Service が 200 を返す
-- [ ] 20 trial で kubectl delete pod を打ち、復活時間を計測
-- [ ] 4 層比較 (bare/OCI/CLI/daemon) に 5 層目を追加した figure
-- [ ] readinessProbe 有無の感度分析 (1〜2 設定)
+**Phase 2 §2.1 完了基準**:
+- [x] kind/k3d cluster で tinyserver Service が 200 を返す
+- [x] 20 trial で kubectl delete pod を打ち、復活時間を計測
+- [x] 4 層比較 (bare/OCI/CLI/daemon) に 5 層目を追加した figure
+- [x] readinessProbe 有無の感度分析 (1〜2 設定)
+
+**実測**:
+- no readinessProbe: p50 = 2.23s, p99 = 3.41s
+- readinessProbe (period=1s): p50 = 2.75s, p99 = 3.57s
+- 詳細は RESULTS.md の Phase 2 節を参照
 
 
 ### Phase 3: 4軸スコア化

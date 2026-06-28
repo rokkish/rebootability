@@ -68,6 +68,15 @@ docker run -d --name rebootbench-nginx --restart=always -p 18080:80 nginx:alpine
 - HTTP probe のみ (Phase 2 で data integrity probe)
 - recorder は同一ホスト (Phase 1 でリモート対応)
 - 集計は手動分析前提 (Phase 4 で自動化)
+- **Docker 29.x で `--restart=always` が `docker kill` 後に発火しない**ため、
+  injector は kill 直後に非同期で `docker start` を発行する。
+  「外部観察者が直ちに再起動を試みる」シナリオの計測となる。
+
+## 実験結果
+
+`RESULTS.md` 参照。Phase 0 では nginx・httpd ともに recovery が probe interval に
+律速され、真の値 (<10ms) を測れていないことが分かった。Phase 1 では push 型 probe
+へ移行する。
 
 ## SQL での確認例
 

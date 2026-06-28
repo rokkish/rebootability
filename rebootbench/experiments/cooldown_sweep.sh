@@ -11,8 +11,11 @@ set -euo pipefail
 
 BIN="${BIN:-./rebootbench}"
 DB="${DB:-rebootbench.db}"
+RUNTIME="${RUNTIME:-docker}"             # docker | podman
 CONTAINER="${CONTAINER:-rebootbench-nginx}"
-IMAGE="${IMAGE:-nginx:alpine}"
+IMAGE="${IMAGE:-nginx:alpine}"           # podman は明示的に docker.io/... を要するので
+                                          # RUNTIME=podman 時は IMAGE_PODMAN を優先
+IMAGE_PODMAN="${IMAGE_PODMAN:-docker.io/library/nginx:alpine}"
 PORT="${PORT:-18080}"
 TRIALS="${TRIALS:-30}"
 INTERVAL="${INTERVAL:-10ms}"
@@ -20,10 +23,17 @@ PROBE_TIMEOUT="${PROBE_TIMEOUT:-8ms}"
 PRE_SETTLE="${PRE_SETTLE:-800ms}"
 POST_SETTLE="${POST_SETTLE:-300ms}"
 COOLDOWNS="${COOLDOWNS:-1s 2s 3s 5s 8s}"
+INJECTOR="${INJECTOR:-restart}"          # kill | kill-start | restart
+KILL_START_DELAY="${KILL_START_DELAY:-0}"
+NOTES_PREFIX="${NOTES_PREFIX:-Phase 0.5 cooldown sweep}"
+
+img() {
+  if [ "$RUNTIME" = "podman" ]; then echo "$IMAGE_PODMAN"; else echo "$IMAGE"; fi
+}
 
 reset_container() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  docker run -d --name "$CONTAINER" --restart=always -p "$PORT:80" "$IMAGE" >/dev/null
+  "$RUNTIME" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  "$RUNTIME" run -d --name "$CONTAINER" --restart=always -p "$PORT:80" "$(img)" >/dev/null
   # warm-up: wait for nginx to actually serve 200
   for i in $(seq 1 20); do
     if curl -fsS -m 1 -o /dev/null "http://localhost:$PORT/"; then return; fi
@@ -37,6 +47,7 @@ for cd in $COOLDOWNS; do
   echo "===== cooldown=$cd start: $(date) ====="
   reset_container
   "$BIN" phase0 \
+    --runtime "$RUNTIME" \
     --container "$CONTAINER" \
     --url "http://localhost:$PORT/" \
     --trials "$TRIALS" \
@@ -45,14 +56,15 @@ for cd in $COOLDOWNS; do
     --pre-settle "$PRE_SETTLE" \
     --post-settle "$POST_SETTLE" \
     --cooldown "$cd" \
-    --injector restart \
+    --injector "$INJECTOR" \
     --restart-grace 0 \
+    --kill-start-delay "$KILL_START_DELAY" \
     --db "$DB" \
-    --notes "Phase 0.5 cooldown sweep cooldown=$cd" \
+    --notes "$NOTES_PREFIX runtime=$RUNTIME injector=$INJECTOR cooldown=$cd" \
     2>&1 | tail -12
   echo "===== cooldown=$cd done:  $(date) ====="
   echo
 done
 
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-echo "sweep complete: $(date)"
+"$RUNTIME" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+echo "sweep complete ($RUNTIME): $(date)"

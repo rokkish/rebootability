@@ -61,6 +61,7 @@ func runPhase0(args []string) {
 	csvPath := fs.String("csv", "", "optional path to write recovery times CSV (default <db_dir>/<experiment_id>.csv)")
 	notes := fs.String("notes", "", "free-form notes saved with the experiment")
 	gitSHA := fs.String("git-sha", "", "git SHA of rebootbench at run time (informational)")
+	runtime := fs.String("runtime", "docker", "container runtime CLI: docker | podman")
 	injectorMode := fs.String("injector", "kill-start",
 		"injection mode: kill | kill-start | restart\n"+
 			"  kill        : docker kill のみ。復活は SUT 環境に依存。\n"+
@@ -93,7 +94,7 @@ func runPhase0(args []string) {
 	if err := rec.SaveExperiment(expRow); err != nil {
 		log.Fatalf("save experiment: %v", err)
 	}
-	log.Printf("experiment %s started: container=%s url=%s trials=%d interval=%s injector=%s", expID, *container, *url, *trials, *interval, *injectorMode)
+	log.Printf("experiment %s started: runtime=%s container=%s url=%s trials=%d interval=%s injector=%s", expID, *runtime, *container, *url, *trials, *interval, *injectorMode)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -105,14 +106,23 @@ func runPhase0(args []string) {
 		cancel()
 	}()
 
+	var rt injector.Runtime
+	switch *runtime {
+	case "docker":
+		rt = injector.RuntimeDocker
+	case "podman":
+		rt = injector.RuntimePodman
+	default:
+		log.Fatalf("unknown --runtime: %s (expected docker|podman)", *runtime)
+	}
 	var inj injector.Injector
 	switch *injectorMode {
 	case "kill":
-		inj = injector.NewDockerKill(*container)
+		inj = injector.NewContainerKill(rt, *container)
 	case "kill-start":
-		inj = injector.NewDockerKillStart(*container, *killStartDelay)
+		inj = injector.NewContainerKillStart(rt, *container, *killStartDelay)
 	case "restart":
-		inj = injector.NewDockerRestart(*container, *restartGrace)
+		inj = injector.NewContainerRestart(rt, *container, *restartGrace)
 	default:
 		log.Fatalf("unknown --injector: %s", *injectorMode)
 	}
